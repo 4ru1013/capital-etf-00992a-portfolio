@@ -1,25 +1,21 @@
 import datetime as dt
 import pathlib
 import re
-from typing import Optional, Tuple
+from typing import Optional
 
 import pandas as pd
-import requests
-from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 ETF_CODE = "00992A"
 ETF_NAME = "群益台灣科技創新主動式ETF"
 PORTFOLIO_URL = "https://www.capitalfund.com.tw/etf/product/detail/500/portfolio"
 
 
-# -----------------------------
-# Utilities
-# -----------------------------
 def ensure_dir(p: pathlib.Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
 
 
-def normalize_text(s: str) -> str:
+def normalize_text(s) -> str:
     return re.sub(r"\s+", " ", str(s)).strip()
 
 
@@ -47,152 +43,119 @@ def to_float_safe(x) -> float:
         return 0.0
 
 
-def extract_data_date(text: str) -> Optional[str]:
-    """
-    Extract YYYYMMDD from the official page.
-    The page usually shows dates like 2026/05/29 near NAV / portfolio section.
-    Pick the latest date found, bounded loosely by today + 2 days.
-    """
-    candidates = []
-    for y, m, d in re.findall(r"(20\d{2})[/-](\d{1,2})[/-](\d{1,2})", text):
+def extract_date_from_filename_or_text(value: str) -> Optional[str]:
+    for y, m, d in re.findall(r"(20\d{2})[/-]?(\d{1,2})[/-]?(\d{1,2})", value):
         try:
             date_obj = dt.date(int(y), int(m), int(d))
         except ValueError:
             continue
-        if date_obj <= dt.date.today() + dt.timedelta(days=2):
-            candidates.append(date_obj)
+        if dt.date(2020, 1, 1) <= date_obj <= dt.date.today() + dt.timedelta(days=7):
+            return date_obj.strftime("%Y%m%d")
+    return None
+
+
+def download_official_excel(raw_dir: pathlib.Path) -> pathlib.Path:
+    ensure_dir(raw_dir)
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(accept_downloads=True, locale="zh-TW")
+        page = context.new_page()
+        print(f"[INFO] Open page: {PORTFOLIO_URL}")
+        page.goto(PORTFOLIO_URL, wait_until="networkidle", timeout=90000)
+
+        try:
+            page.locator("button", has_text="下載資料").first.wait_for(timeout=30000)
+        except PlaywrightTimeoutError as exc:
+            html_path = raw_dir / f"{ETF_CODE}_debug_page.html"
+            html_path.write_text(page.content(), encoding="utf-8")
+            raise RuntimeError(f"找不到下載資料按鈕，已保存 debug HTML: {html_path}") from exc
+
+        with page.expect_download(timeout=90000) as download_info:
+            page.locator("button", has_text="下載資料").first.click()
+
+        download = download_info.value
+        suggested = download.suggested_filename or f"{ETF_CODE}.xlsx"
+        if not suggested.lower().endswith((".xlsx", ".xls")):
+            suggested = f"{ETF_CODE}.xlsx"
+
+        data_date = extract_date_from_filename_or_text(suggested) or dt.date.today().strftime("%Y%m%d")
+        out_path = raw_dir / f"{ETF_CODE}_portfolio_{data_date}.xlsx"
+        download.save_as(str(out_path))
+        print(f"[OK] Downloaded official Excel: {out_path}")
+        browser.close()
+        return out_path
+
+
+def locate_header_row(df: pd.DataFrame) -> Optional[int]:
+    for idx in range(len(df)):
+        values = [normalize_text(x) for x in df.iloc[idx].tolist()]
+        joined = "|".join(values)
+        if "股票代號" in joined and "股票名稱" in joined and "持股權重" in joined and "股數" in joined:
+            return idx
+    return None
+
+
+def parse_stock_sheet(excel_path: pathlib.Path) -> pd.DataFrame:
+    xls = pd.ExcelFile(excel_path)
+    print(f"[INFO] Excel sheets: {xls.sheet_names}")
+
+    candidates = []
+    for sheet in xls.sheet_names:
+        raw = pd.read_excel(excel_path, sheet_name=sheet, header=None, dtype=object)
+        header_idx = locate_header_row(raw)
+        if header_idx is not None:
+            candidates.append((sheet, raw, header_idx))
 
     if not candidates:
-        return None
-    return max(candidates).strftime("%Y%m%d")
+        raise RuntimeError("Excel 中找不到含有『股票代號／股票名稱／持股權重／股數』的股票分頁。")
 
+    # Prefer sheet whose name contains 股票; otherwise use the first matched sheet.
+    sheet, raw, header_idx = sorted(candidates, key=lambda x: ("股票" not in str(x[0]), str(x[0])))[0]
+    print(f"[INFO] Selected stock sheet: {sheet}, header row: {header_idx}")
 
-# -----------------------------
-# Core: Download, Parse, Diff
-# -----------------------------
-def download_html(session: requests.Session) -> str:
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/130.0 Safari/537.36"
-        ),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Referer": "https://www.capitalfund.com.tw/etf/product",
-    }
-    resp = session.get(PORTFOLIO_URL, headers=headers, timeout=60)
-    resp.raise_for_status()
-    print(f"[INFO] 下載官方頁面成功：{resp.url}")
-    print(f"[INFO] Content-Type: {resp.headers.get('Content-Type')}")
-    return resp.text
+    headers = [normalize_text(x) for x in raw.iloc[header_idx].tolist()]
+    body = raw.iloc[header_idx + 1 :].copy()
+    body.columns = headers
 
+    def find_col(keyword: str) -> str:
+        for c in body.columns:
+            if keyword in str(c):
+                return c
+        raise RuntimeError(f"找不到欄位：{keyword}，目前欄位={list(body.columns)}")
 
-def parse_holdings_from_html(html: str) -> Tuple[pd.DataFrame, Optional[str]]:
-    soup = BeautifulSoup(html, "html.parser")
-    text = soup.get_text("\n", strip=True)
-    data_date = extract_data_date(text)
-    if data_date:
-        print(f"[INFO] data_date = {data_date}")
-    else:
-        print("[WARN] 無法從頁面抓到資料日期，將以今天日期做檔名。")
+    code_col = find_col("股票代號")
+    name_col = find_col("股票名稱")
+    weight_col = find_col("持股權重")
+    shares_col = find_col("股數")
 
-    # Official page text pattern around holdings:
-    # 股票代號 \n 股票名稱 ... \n 持股權重(%) \n 股數 \n 2330 \n 台積電 \n 8.07% \n 1,761,000
-    # This regex intentionally requires shares, so duplicated display-only rows without shares are ignored.
-    pattern = re.compile(
-        r"(?m)^\s*(\d{4}[A-Za-z]?)\s*$\s*\n"
-        r"^\s*([^\n\d%][^\n]*)\s*$\s*\n"
-        r"^\s*(\d+(?:\.\d+)?)\s*%\s*$\s*\n"
-        r"^\s*([\d,]+)\s*$"
-    )
+    df = body[[code_col, name_col, weight_col, shares_col]].copy()
+    df.columns = ["code", "name", "weight", "shares"]
 
-    rows = []
-    for code, name, weight, shares in pattern.findall(text):
-        code = normalize_text(code)
-        name = normalize_text(name)
-        rows.append(
-            {
-                "code": code,
-                "name": name,
-                "weight": to_float_safe(weight),
-                "shares": to_int_safe(shares),
-            }
-        )
+    df["code"] = df["code"].map(normalize_text)
+    df["name"] = df["name"].map(normalize_text)
+    df["weight"] = df["weight"].map(to_float_safe)
+    df["shares"] = df["shares"].map(to_int_safe)
 
-    if not rows:
-        # Fallback: parse all visible lines by state machine.
-        lines = [normalize_text(x) for x in text.splitlines() if normalize_text(x)]
-        for i, line in enumerate(lines):
-            if not re.fullmatch(r"\d{4}[A-Za-z]?", line):
-                continue
-            window = lines[i : i + 8]
-            if len(window) < 4:
-                continue
-            name = window[1]
-            weight = None
-            shares = None
-            for item in window[2:]:
-                if weight is None and re.fullmatch(r"\d+(?:\.\d+)?%", item):
-                    weight = item
-                elif weight is not None and shares is None and re.fullmatch(r"[\d,]+", item):
-                    shares = item
-                    break
-            if weight and shares and not re.search(r"股票|代號|名稱|權重|股數", name):
-                rows.append(
-                    {
-                        "code": line,
-                        "name": name,
-                        "weight": to_float_safe(weight),
-                        "shares": to_int_safe(shares),
-                    }
-                )
+    df = df[df["code"].str.fullmatch(r"\d{4}[A-Za-z]?", na=False)].copy()
+    df = df[df["shares"] > 0].copy()
+    df = df.sort_values(["weight", "shares"], ascending=[False, False]).reset_index(drop=True)
 
-    if not rows:
-        preview = "\n".join(text.splitlines()[:120])
-        raise RuntimeError(
-            "找不到 00992A 持股資料。可能是群益網站 HTML 結構改版或資料改由 JS API 載入。\n\n"
-            f"頁面文字預覽：\n{preview}"
-        )
+    if len(df) <= 10:
+        raise RuntimeError(f"解析後只有 {len(df)} 檔，疑似仍非完整 Excel 股票分頁。")
 
-    df = pd.DataFrame(rows)
-    df["code"] = df["code"].astype("string").str.strip()
-    df["name"] = df["name"].astype("string").str.strip()
-    df["shares"] = df["shares"].astype(int)
-    df["weight"] = df["weight"].astype(float)
-
-    # Remove duplicated rows caused by responsive duplicate tables.
-    # If the same code appears more than once, keep the row with the largest shares; weight is usually identical.
-    df = (
-        df.sort_values(["code", "shares"], ascending=[True, False])
-        .drop_duplicates(subset=["code"], keep="first")
-        .sort_values(["weight", "shares"], ascending=[False, False])
-        .reset_index(drop=True)
-    )
-
-    if len(df) < 5:
-        raise RuntimeError(f"解析到的持股數過少：{len(df)}，請檢查官方頁面格式是否改版。")
-
-    return df, data_date
+    print(f"[OK] Parsed {len(df)} stock holdings from Excel.")
+    return df
 
 
 def compute_diff(prev_df: pd.DataFrame, curr_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Return diff dataframe with columns:
-      code, name, prev_shares, curr_shares, delta, status
-    status: NEW / OUT / UP / DOWN / SAME
-    """
     prev = prev_df.copy()
     curr = curr_df.copy()
-
     prev["code"] = prev["code"].astype("string").str.strip()
     curr["code"] = curr["code"].astype("string").str.strip()
-
     prev = prev.rename(columns={"shares": "prev_shares"})
     curr = curr.rename(columns={"shares": "curr_shares"})
 
     merged = prev.merge(curr, on=["code"], how="outer", suffixes=("_prev", "_curr"))
-
     merged["name"] = merged.get("name_curr", "").fillna("")
     if "name_prev" in merged.columns:
         merged.loc[merged["name"].eq("") | merged["name"].isna(), "name"] = merged["name_prev"].fillna("")
@@ -213,36 +176,28 @@ def compute_diff(prev_df: pd.DataFrame, curr_df: pd.DataFrame) -> pd.DataFrame:
         return "SAME"
 
     merged["status"] = merged.apply(status_row, axis=1)
-
     order_map = {"NEW": 0, "UP": 1, "DOWN": 2, "OUT": 3, "SAME": 4}
     merged["order"] = merged["status"].map(order_map).fillna(99)
     merged = merged.sort_values(["order", "delta"], ascending=[True, False]).drop(columns=["order"])
-
     return merged[["code", "name", "prev_shares", "curr_shares", "delta", "status"]].reset_index(drop=True)
 
 
 def write_summary_markdown(diff_df: pd.DataFrame, out_md: pathlib.Path, data_date: str) -> None:
-    def top_rows(status, n=20):
-        sub = diff_df[diff_df["status"] == status].copy()
-        if status in ("DOWN", "OUT"):
-            sub = sub.sort_values("delta")
-        elif status in ("UP", "NEW"):
-            sub = sub.sort_values("delta", ascending=False)
-        return sub.head(n)
-
-    lines = []
-    lines.append(f"# {ETF_CODE} Holdings Diff ({data_date})\n\n")
-
+    lines = [f"# {ETF_CODE} Holdings Diff ({data_date})\n\n"]
     counts = diff_df["status"].value_counts().to_dict()
     lines.append("## Summary\n\n")
     lines.append(
         f"- NEW: {counts.get('NEW',0)} | UP: {counts.get('UP',0)} | "
         f"DOWN: {counts.get('DOWN',0)} | OUT: {counts.get('OUT',0)} | SAME: {counts.get('SAME',0)}\n\n"
     )
-
-    for sec, label in [("NEW", "新增持股"), ("UP", "加碼"), ("DOWN", "減碼"), ("OUT", "出清")]:
-        sub = top_rows(sec, n=20)
-        lines.append(f"## {label} ({sec})\n\n")
+    for status, label in [("NEW", "新增持股"), ("UP", "加碼"), ("DOWN", "減碼"), ("OUT", "出清")]:
+        sub = diff_df[diff_df["status"] == status].copy()
+        if status in ("DOWN", "OUT"):
+            sub = sub.sort_values("delta")
+        else:
+            sub = sub.sort_values("delta", ascending=False)
+        sub = sub.head(20)
+        lines.append(f"## {label} ({status})\n\n")
         if sub.empty:
             lines.append("_None_\n\n")
             continue
@@ -254,7 +209,6 @@ def write_summary_markdown(diff_df: pd.DataFrame, out_md: pathlib.Path, data_dat
                 f"{r['prev_shares']} | {r['curr_shares']} | {r['delta']} | {r['status']} |\n"
             )
         lines.append("\n")
-
     out_md.write_text("".join(lines), encoding="utf-8")
 
 
@@ -265,44 +219,29 @@ def main():
     ensure_dir(raw_dir)
     ensure_dir(out_dir)
 
-    session = requests.Session()
-    html = download_html(session)
-
-    holdings_df, data_date = parse_holdings_from_html(html)
-    if not data_date:
-        data_date = dt.date.today().strftime("%Y%m%d")
-
-    raw_path = raw_dir / f"{ETF_CODE}_portfolio_{data_date}.html"
-    if raw_path.exists():
-        print(f"[INFO] Raw HTML already exists: {raw_path}")
-    else:
-        raw_path.write_text(html, encoding="utf-8")
-        print(f"[OK] Saved HTML snapshot to {raw_path}")
+    excel_path = download_official_excel(raw_dir)
+    data_date = extract_date_from_filename_or_text(excel_path.name) or dt.date.today().strftime("%Y%m%d")
+    holdings_df = parse_stock_sheet(excel_path)
 
     holdings_path = out_dir / f"{ETF_CODE}_holdings_{data_date}.csv"
     holdings_df.to_csv(holdings_path, index=False, encoding="utf-8-sig")
     print(f"[OK] Saved standardized holdings to {holdings_path}")
 
     latest_path = out_dir / f"{ETF_CODE}_latest.csv"
-
     if latest_path.exists():
         prev_df = pd.read_csv(latest_path, dtype={"code": "string"})
-        if "code" in prev_df.columns:
-            prev_df["code"] = prev_df["code"].str.strip()
-
-        if not {"code", "shares"}.issubset(set(prev_df.columns)):
-            print("[WARN] latest.csv 格式不對，將略過 diff。")
-        else:
+        if {"code", "shares"}.issubset(set(prev_df.columns)):
             diff_df = compute_diff(prev_df, holdings_df)
             diff_path = out_dir / f"{ETF_CODE}_diff_{data_date}.csv"
             diff_df.to_csv(diff_path, index=False, encoding="utf-8-sig")
             print(f"[OK] Saved diff to {diff_path}")
-
             md_path = out_dir / f"{ETF_CODE}_diff_{data_date}.md"
             write_summary_markdown(diff_df, md_path, data_date)
             print(f"[OK] Saved diff summary to {md_path}")
+        else:
+            print("[WARN] latest.csv format invalid; diff skipped.")
     else:
-        print("[INFO] No previous latest.csv found; diff skipped (first run).")
+        print("[INFO] No previous latest.csv found; diff skipped.")
 
     holdings_df.to_csv(latest_path, index=False, encoding="utf-8-sig")
     print(f"[OK] Updated latest to {latest_path}")
