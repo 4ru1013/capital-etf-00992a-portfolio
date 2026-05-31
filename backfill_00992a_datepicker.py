@@ -23,8 +23,19 @@ def iter_dates(start, end):
         cur += dt.timedelta(days=1)
 
 
+def get_calendar_text(page):
+    picker = page.locator('ngb-datepicker')
+    if picker.count() > 0:
+        try:
+            return picker.first.inner_text(timeout=3000)
+        except Exception:
+            pass
+    # fallback only if ngb-datepicker is not available
+    return page.locator('body').inner_text(timeout=5000)
+
+
 def get_calendar_month(page):
-    txt = page.locator('body').inner_text(timeout=5000)
+    txt = get_calendar_text(page)
     year_match = re.search(r'(20\d{2})', txt)
     if not year_match:
         return None
@@ -63,11 +74,29 @@ def click_date_input(page):
 
 
 def click_month_arrow(page, direction):
-    if direction < 0:
-        page.mouse.click(62, 304)
+    buttons = page.locator('ngb-datepicker button')
+    visible = []
+    for i in range(buttons.count()):
+        b = buttons.nth(i)
+        try:
+            box = b.bounding_box()
+            if box:
+                visible.append((box['x'], box['y'], b))
+        except Exception:
+            pass
+    if len(visible) >= 2:
+        visible.sort(key=lambda x: (x[1], x[0]))
+        if direction < 0:
+            visible[0][2].click()
+        else:
+            visible[-1][2].click()
     else:
-        page.mouse.click(328, 304)
-    page.wait_for_timeout(700)
+        # fallback based on DatePicker screenshot geometry
+        if direction < 0:
+            page.mouse.click(126, 632)
+        else:
+            page.mouse.click(688, 632)
+    page.wait_for_timeout(800)
 
 
 def goto_month(page, target):
@@ -77,6 +106,8 @@ def goto_month(page, target):
         if ym == (target.year, target.month):
             return
         if ym is None:
+            print('[DEBUG] calendar text:')
+            print(get_calendar_text(page))
             raise RuntimeError('calendar month not detected')
         cur = ym[0] * 12 + ym[1]
         tgt = target.year * 12 + target.month
@@ -85,15 +116,20 @@ def goto_month(page, target):
 
 
 def click_day(page, target):
-    first = target.replace(day=1)
-    first_col = (first.weekday() + 1) % 7
-    target_col = (target.weekday() + 1) % 7
-    row = (first_col + target.day - 1) // 7
-    x = 65 + target_col * 44
-    y = 487 + row * 53
-    print(f'[INFO] click date {target:%Y-%m-%d} at x={x}, y={y}')
-    page.mouse.click(x, y)
-    page.wait_for_timeout(1800)
+    day = str(target.day)
+    picker = page.locator('ngb-datepicker')
+    loc = picker.locator(f'text="{day}"') if picker.count() > 0 else page.locator(f'text="{day}"')
+    for i in range(loc.count()):
+        el = loc.nth(i)
+        try:
+            if el.inner_text(timeout=1000).strip() == day and el.bounding_box():
+                print(f'[INFO] click date {target:%Y-%m-%d} by text {day}')
+                el.click()
+                page.wait_for_timeout(1800)
+                return
+        except Exception:
+            pass
+    raise RuntimeError(f'day not found: {day}')
 
 
 def select_date(page, target):
