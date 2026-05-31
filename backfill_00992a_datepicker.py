@@ -48,11 +48,43 @@ def set_condition_date(page, target: dt.date) -> None:
         value,
     )
     page.keyboard.press('Enter')
+    page.keyboard.press('Escape')
+    page.mouse.click(20, 20)
     page.wait_for_timeout(1200)
     current = field.input_value(timeout=3000)
     print(f'[INFO] condition-date set to {current}')
     if current != value:
         raise RuntimeError(f'condition-date value mismatch: expected {value}, got {current}')
+
+
+def close_datepicker_overlay(page) -> None:
+    page.keyboard.press('Escape')
+    page.mouse.click(20, 20)
+    page.wait_for_timeout(500)
+    page.evaluate(
+        """
+        () => {
+          for (const el of document.querySelectorAll('ngx-datepicker, .ngx-datepicker-container, .top-container')) {
+            const r = el.getBoundingClientRect();
+            if (r.width > 0 && r.height > 0) {
+              el.style.pointerEvents = 'none';
+            }
+          }
+        }
+        """
+    )
+
+
+def click_download(page) -> None:
+    close_datepicker_overlay(page)
+    button = page.locator('button.buyback-search-section-btn').first
+    button.wait_for(state='visible', timeout=30000)
+    button.scroll_into_view_if_needed(timeout=10000)
+    try:
+        button.click(timeout=5000)
+    except Exception as exc:
+        print(f'[WARN] normal download click failed, retry with force: {exc}')
+        button.click(force=True, timeout=10000)
 
 
 def download_one(page, raw_dir: pathlib.Path, out_dir: pathlib.Path, target: dt.date) -> pathlib.Path:
@@ -62,7 +94,7 @@ def download_one(page, raw_dir: pathlib.Path, out_dir: pathlib.Path, target: dt.
 
     set_condition_date(page, target)
     with page.expect_download(timeout=90000) as info:
-        page.locator('button', has_text='下載資料').first.click()
+        click_download(page)
     info.value.save_as(str(xlsx_path))
     print(f'[OK] downloaded {ymd}: {xlsx_path}')
 
