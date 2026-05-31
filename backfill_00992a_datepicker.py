@@ -30,7 +30,6 @@ def get_calendar_text(page):
             return picker.first.inner_text(timeout=3000)
         except Exception:
             pass
-    # fallback only if ngb-datepicker is not available
     return page.locator('body').inner_text(timeout=5000)
 
 
@@ -50,27 +49,30 @@ def get_calendar_month(page):
 
 
 def click_date_input(page):
-    inputs = page.locator('input')
-    for i in range(inputs.count()):
-        el = inputs.nth(i)
+    # Do not click the first input; that is the search box. Click a visible date-like element in the portfolio area.
+    dates = page.locator('text=/20\\d{2}\\/\\d{2}\\/\\d{2}/')
+    candidates = []
+    for i in range(dates.count()):
+        el = dates.nth(i)
         try:
-            val = el.input_value(timeout=1000)
-            if re.search(r'20\d{2}[/-]\d{1,2}[/-]\d{1,2}', val) and el.bounding_box():
-                el.click()
-                page.wait_for_timeout(700)
-                return
+            box = el.bounding_box()
+            txt = el.inner_text(timeout=1000).strip()
+            if box and re.search(r'20\d{2}/\d{2}/\d{2}', txt):
+                candidates.append((box['y'], box['x'], el, txt))
         except Exception:
             pass
-    for i in range(inputs.count()):
-        el = inputs.nth(i)
-        try:
-            if el.bounding_box():
-                el.click()
-                page.wait_for_timeout(700)
-                return
-        except Exception:
-            pass
-    raise RuntimeError('date input not found')
+    if candidates:
+        candidates.sort(key=lambda x: (x[0], x[1]))
+        # Prefer the lowest visible date because top dates are NAV labels; portfolio date is lower.
+        chosen = candidates[-1]
+        print(f'[INFO] click date field text={chosen[3]} y={chosen[0]}')
+        chosen[2].click()
+        page.wait_for_timeout(900)
+        return
+    # Mobile fallback based on the screenshot: portfolio date field is around upper-middle of page.
+    print('[INFO] date text not found, click portfolio date fallback coordinate')
+    page.mouse.click(180, 512)
+    page.wait_for_timeout(900)
 
 
 def click_month_arrow(page, direction):
@@ -91,7 +93,6 @@ def click_month_arrow(page, direction):
         else:
             visible[-1][2].click()
     else:
-        # fallback based on DatePicker screenshot geometry
         if direction < 0:
             page.mouse.click(126, 632)
         else:
