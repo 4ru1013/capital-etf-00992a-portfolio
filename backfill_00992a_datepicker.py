@@ -24,13 +24,16 @@ def iter_dates(start, end):
 
 
 def get_calendar_text(page):
-    picker = page.locator('ngb-datepicker')
-    if picker.count() > 0:
-        try:
-            return picker.first.inner_text(timeout=3000)
-        except Exception:
-            pass
-    return page.locator('body').inner_text(timeout=5000)
+    for sel in ['ngb-datepicker', '.ngb-dp', '.dropdown-menu', '.bs-datepicker', '.mat-datepicker-content']:
+        loc = page.locator(sel)
+        if loc.count() > 0:
+            try:
+                txt = loc.first.inner_text(timeout=1500)
+                if txt.strip():
+                    return txt
+            except Exception:
+                pass
+    return ''
 
 
 def get_calendar_month(page):
@@ -49,55 +52,52 @@ def get_calendar_month(page):
 
 
 def click_date_input(page):
-    # Do not click the first input; that is the search box. Click a visible date-like element in the portfolio area.
-    dates = page.locator('text=/20\\d{2}\\/\\d{2}\\/\\d{2}/')
-    candidates = []
-    for i in range(dates.count()):
-        el = dates.nth(i)
-        try:
-            box = el.bounding_box()
-            txt = el.inner_text(timeout=1000).strip()
-            if box and re.search(r'20\d{2}/\d{2}/\d{2}', txt):
-                candidates.append((box['y'], box['x'], el, txt))
-        except Exception:
-            pass
-    if candidates:
-        candidates.sort(key=lambda x: (x[0], x[1]))
-        # Prefer the lowest visible date because top dates are NAV labels; portfolio date is lower.
-        chosen = candidates[-1]
-        print(f'[INFO] click date field text={chosen[3]} y={chosen[0]}')
-        chosen[2].click()
+    label = page.locator('text=最新日期').last
+    if label.count() == 0:
+        raise RuntimeError('latest-date label not found')
+    label.scroll_into_view_if_needed(timeout=5000)
+    page.wait_for_timeout(500)
+    box = label.bounding_box()
+    if not box:
+        raise RuntimeError('latest-date label has no bounding box')
+    # The actual date field is visually below or near the label on mobile.
+    click_points = [
+        (box['x'] + box['width'] / 2, box['y'] + box['height'] + 42),
+        (box['x'] + box['width'] / 2, box['y'] + box['height'] + 70),
+        (195, min(box['y'] + box['height'] + 42, 900)),
+        (195, min(box['y'] + box['height'] + 70, 930)),
+    ]
+    for x, y in click_points:
+        print(f'[INFO] try click latest-date field at x={x:.1f}, y={y:.1f}')
+        page.mouse.click(x, y)
         page.wait_for_timeout(900)
-        return
-    # Mobile fallback based on the screenshot: portfolio date field is around upper-middle of page.
-    print('[INFO] date text not found, click portfolio date fallback coordinate')
-    page.mouse.click(180, 512)
-    page.wait_for_timeout(900)
+        if get_calendar_text(page).strip():
+            print('[INFO] calendar opened')
+            return
+    raise RuntimeError('calendar did not open after clicking latest-date field')
 
 
 def click_month_arrow(page, direction):
-    buttons = page.locator('ngb-datepicker button')
-    visible = []
-    for i in range(buttons.count()):
-        b = buttons.nth(i)
-        try:
-            box = b.bounding_box()
-            if box:
-                visible.append((box['x'], box['y'], b))
-        except Exception:
-            pass
-    if len(visible) >= 2:
-        visible.sort(key=lambda x: (x[1], x[0]))
-        if direction < 0:
-            visible[0][2].click()
-        else:
-            visible[-1][2].click()
-    else:
-        if direction < 0:
-            page.mouse.click(126, 632)
-        else:
-            page.mouse.click(688, 632)
-    page.wait_for_timeout(800)
+    for sel in ['ngb-datepicker button', '.ngb-dp button', '.dropdown-menu button', '.bs-datepicker button', '.mat-datepicker-content button']:
+        buttons = page.locator(sel)
+        visible = []
+        for i in range(buttons.count()):
+            b = buttons.nth(i)
+            try:
+                box = b.bounding_box()
+                if box:
+                    visible.append((box['x'], box['y'], b))
+            except Exception:
+                pass
+        if len(visible) >= 2:
+            visible.sort(key=lambda x: (x[1], x[0]))
+            if direction < 0:
+                visible[0][2].click()
+            else:
+                visible[-1][2].click()
+            page.wait_for_timeout(800)
+            return
+    raise RuntimeError('calendar arrow buttons not found')
 
 
 def goto_month(page, target):
@@ -118,18 +118,21 @@ def goto_month(page, target):
 
 def click_day(page, target):
     day = str(target.day)
-    picker = page.locator('ngb-datepicker')
-    loc = picker.locator(f'text="{day}"') if picker.count() > 0 else page.locator(f'text="{day}"')
-    for i in range(loc.count()):
-        el = loc.nth(i)
-        try:
-            if el.inner_text(timeout=1000).strip() == day and el.bounding_box():
-                print(f'[INFO] click date {target:%Y-%m-%d} by text {day}')
-                el.click()
-                page.wait_for_timeout(1800)
-                return
-        except Exception:
-            pass
+    for sel in ['ngb-datepicker', '.ngb-dp', '.dropdown-menu', '.bs-datepicker', '.mat-datepicker-content']:
+        container = page.locator(sel)
+        if container.count() == 0:
+            continue
+        loc = container.locator(f'text="{day}"')
+        for i in range(loc.count()):
+            el = loc.nth(i)
+            try:
+                if el.inner_text(timeout=1000).strip() == day and el.bounding_box():
+                    print(f'[INFO] click date {target:%Y-%m-%d} by text {day}')
+                    el.click()
+                    page.wait_for_timeout(1800)
+                    return
+            except Exception:
+                pass
     raise RuntimeError(f'day not found: {day}')
 
 
