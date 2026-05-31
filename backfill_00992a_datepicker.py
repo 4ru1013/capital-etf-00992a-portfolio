@@ -63,36 +63,17 @@ def click_date_input(page):
 
 
 def click_month_arrow(page, direction):
-    # direction: -1 previous month, +1 next month.
-    buttons = page.locator('button')
-    candidates = []
-    for i in range(buttons.count()):
-        b = buttons.nth(i)
-        try:
-            box = b.bounding_box()
-            if box:
-                candidates.append((box['x'], box['y'], b))
-        except Exception:
-            pass
-    if not candidates:
-        # fallback by screen coordinate near calendar header
-        if direction < 0:
-            page.mouse.click(60, 305)
-        else:
-            page.mouse.click(335, 305)
-        page.wait_for_timeout(600)
-        return
-    candidates.sort(key=lambda x: (x[1], x[0]))
     if direction < 0:
-        candidates[0][2].click()
+        page.mouse.click(62, 304)
     else:
-        candidates[-1][2].click()
-    page.wait_for_timeout(600)
+        page.mouse.click(328, 304)
+    page.wait_for_timeout(700)
 
 
 def goto_month(page, target):
     for _ in range(36):
         ym = get_calendar_month(page)
+        print(f'[INFO] calendar month detected: {ym}, target: {(target.year, target.month)}')
         if ym == (target.year, target.month):
             return
         if ym is None:
@@ -104,18 +85,15 @@ def goto_month(page, target):
 
 
 def click_day(page, target):
-    day = str(target.day)
-    loc = page.locator(f'text="{day}"')
-    for i in range(loc.count()):
-        el = loc.nth(i)
-        try:
-            if el.inner_text(timeout=1000).strip() == day and el.bounding_box():
-                el.click()
-                page.wait_for_timeout(1800)
-                return
-        except Exception:
-            pass
-    raise RuntimeError(f'day not found: {day}')
+    first = target.replace(day=1)
+    first_col = (first.weekday() + 1) % 7
+    target_col = (target.weekday() + 1) % 7
+    row = (first_col + target.day - 1) // 7
+    x = 65 + target_col * 44
+    y = 487 + row * 53
+    print(f'[INFO] click date {target:%Y-%m-%d} at x={x}, y={y}')
+    page.mouse.click(x, y)
+    page.wait_for_timeout(1800)
 
 
 def select_date(page, target):
@@ -141,7 +119,8 @@ def save_holdings(excel_path, out_dir, target):
     out = out_dir / f'{ETF_CODE}_holdings_{ymd}.csv'
     df = parse_stock_sheet(excel_path)
     df.to_csv(out, index=False, encoding='utf-8-sig')
-    print(f'[OK] saved holdings {out}')
+    print(f'[OK] saved holdings {out}, rows={len(df)}')
+    return out
 
 
 def rebuild_diffs(out_dir):
@@ -181,19 +160,19 @@ def main():
     out_dir = pathlib.Path('data/out')
     ensure_dir(raw_dir)
     ensure_dir(out_dir)
+    saved = []
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(accept_downloads=True, locale='zh-TW', viewport={'width': 390, 'height': 1200})
         page = context.new_page()
         page.goto(PORTFOLIO_URL, wait_until='networkidle', timeout=90000)
         for d in dates:
-            try:
-                xlsx = download_for_date(page, raw_dir, d)
-                save_holdings(xlsx, out_dir, d)
-            except Exception as exc:
-                print(f'[WARN] failed {d:%Y%m%d}: {exc}')
+            xlsx = download_for_date(page, raw_dir, d)
+            saved.append(save_holdings(xlsx, out_dir, d))
             time.sleep(1)
         browser.close()
+    if not saved:
+        raise RuntimeError('no holdings files saved')
     rebuild_diffs(out_dir)
     update_latest(out_dir)
 
